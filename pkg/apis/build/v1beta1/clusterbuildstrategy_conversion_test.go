@@ -6,6 +6,7 @@ package v1beta1_test
 
 import (
 	"context"
+	"encoding/json"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -25,19 +26,7 @@ func sampleBetaCBS() *buildapi.ClusterBuildStrategy {
 			Labels:      map[string]string{"app": "test"},
 			Annotations: map[string]string{"note": "hi"},
 		},
-		Spec: buildapi.BuildStrategySpec{
-			Steps: []buildapi.Step{{
-				Name:    "build",
-				Image:   "gcr.io/kaniko:latest",
-				Command: []string{"sh"},
-				Args:    []string{"-c", "echo hi"},
-			}},
-			Parameters: []buildapi.Parameter{{
-				Name:        "my-param",
-				Description: "a plain param",
-				Type:        buildapi.ParameterTypeString,
-			}},
-		},
+		Spec: sampleBetaBuildStrategy().Spec,
 	}
 }
 
@@ -118,10 +107,42 @@ var _ = Describe("ClusterBuildStrategy conversion", func() {
 		Expect(got.Spec.Steps).To(Equal(start.Spec.Steps))
 		Expect(got.Spec.Parameters).To(Equal(start.Spec.Parameters))
 		Expect(got.Spec.SecurityContext).To(Equal(start.Spec.SecurityContext))
-		// ConvertTo/ConvertFrom normalize nil slices to empty ones
-		// (they init `Volumes = []...`), so assert emptiness, not nil-ness.
-		Expect(got.Spec.Volumes).To(BeEmpty())
+		Expect(got.Spec.Volumes).To(Equal(start.Spec.Volumes))
 		Expect(got.Name).To(Equal(start.Name))
 		Expect(got.APIVersion).To(Equal("shipwright.io/v1beta1"))
+	})
+})
+
+var _ = Describe("ClusterBuildStrategy conversion field coverage", func() {
+	DescribeTable("preserves parameter defaults and all step fields in both directions", func(raw string) {
+		beta := sampleBetaCBS()
+		beta.Kind, beta.APIVersion = "ClusterBuildStrategy", "shipwright.io/v1beta1"
+		alpha := &buildapialpha.ClusterBuildStrategy{TypeMeta: metav1.TypeMeta{Kind: "ClusterBuildStrategy", APIVersion: "shipwright.io/v1alpha1"}, ObjectMeta: beta.ObjectMeta, Spec: sampleAlphaStrategySpec()}
+		Expect(json.Unmarshal([]byte(raw), &alpha.Spec.Parameters)).To(Succeed())
+		Expect(json.Unmarshal([]byte(raw), &beta.Spec.Parameters)).To(Succeed())
+		origBeta, origAlpha := beta.DeepCopy(), alpha.DeepCopy()
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		var gotAlpha buildapialpha.ClusterBuildStrategy
+		Expect(runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &gotAlpha)).To(Succeed())
+		expectSameJSON(gotAlpha, origAlpha)
+		got := &buildapi.ClusterBuildStrategy{}
+		Expect(got.ConvertFrom(context.Background(), asUnstructured(alpha))).To(Succeed())
+		expectSameJSON(got, origBeta)
+		Expect(got.ConvertTo(context.Background(), u)).To(Succeed())
+		Expect(runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &gotAlpha)).To(Succeed())
+		expectSameJSON(gotAlpha, origAlpha)
+		expectSameJSON(beta, origBeta)
+	}, strategyParameterEntries())
+
+	It("round-trips absent optional fields", func() {
+		start := &buildapialpha.ClusterBuildStrategy{TypeMeta: metav1.TypeMeta{Kind: "ClusterBuildStrategy", APIVersion: "shipwright.io/v1alpha1"}, Spec: buildapialpha.BuildStrategySpec{BuildSteps: []buildapialpha.BuildStep{{Container: corev1.Container{Name: "build", Image: "builder"}}}}}
+		beta := &buildapi.ClusterBuildStrategy{}
+		Expect(beta.ConvertFrom(context.Background(), asUnstructured(start))).To(Succeed())
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		var got buildapialpha.ClusterBuildStrategy
+		Expect(runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &got)).To(Succeed())
+		expectSameJSON(got, start)
 	})
 })

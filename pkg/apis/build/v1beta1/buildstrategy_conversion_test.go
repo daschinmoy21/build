@@ -6,6 +6,7 @@ package v1beta1_test
 
 import (
 	"context"
+	"encoding/json"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -36,11 +37,15 @@ func sampleBetaBuildStrategy() *buildapi.BuildStrategy {
 				WorkingDir:      "/workspace",
 				Env:             []corev1.EnvVar{{Name: "FOO", Value: "bar"}},
 				ImagePullPolicy: corev1.PullIfNotPresent,
+				Resources:       conversionStepResources(),
+				VolumeMounts:    []corev1.VolumeMount{{Name: "cache", MountPath: "/cache", ReadOnly: true}},
+				SecurityContext: &corev1.SecurityContext{RunAsUser: ptr.To[int64](1001), RunAsGroup: ptr.To[int64](1002), AllowPrivilegeEscalation: ptr.To(false)},
 			}},
 			Parameters: []buildapi.Parameter{{
 				Name:        "my-param",
 				Description: "a plain param",
 				Type:        buildapi.ParameterTypeString,
+				Default:     ptr.To("default-value"),
 			}},
 			SecurityContext: &buildapi.BuildStrategySecurityContext{
 				RunAsUser:  1000,
@@ -381,4 +386,43 @@ var _ = Describe("BuildStrategy conversion", func() {
 		Expect(got.Namespace).To(Equal(orig.Namespace))
 		Expect(got.APIVersion).To(Equal("shipwright.io/v1beta1"))
 	})
+})
+
+var _ = Describe("BuildStrategy conversion field coverage", func() {
+	DescribeTable("preserves parameter defaults and all step fields in both directions", func(raw string) {
+		beta := sampleBetaBuildStrategy()
+		beta.Kind, beta.APIVersion = "BuildStrategy", "shipwright.io/v1beta1"
+		alpha := &buildapialpha.BuildStrategy{TypeMeta: metav1.TypeMeta{Kind: "BuildStrategy", APIVersion: "shipwright.io/v1alpha1"}, ObjectMeta: beta.ObjectMeta, Spec: sampleAlphaStrategySpec()}
+		Expect(json.Unmarshal([]byte(raw), &alpha.Spec.Parameters)).To(Succeed())
+		Expect(json.Unmarshal([]byte(raw), &beta.Spec.Parameters)).To(Succeed())
+		origBeta, origAlpha := beta.DeepCopy(), alpha.DeepCopy()
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		expectSameJSON(alphaFromUnstructured(u), origAlpha)
+		got := &buildapi.BuildStrategy{}
+		Expect(got.ConvertFrom(context.Background(), asUnstructured(alpha))).To(Succeed())
+		expectSameJSON(got, origBeta)
+		Expect(got.ConvertTo(context.Background(), u)).To(Succeed())
+		expectSameJSON(alphaFromUnstructured(u), origAlpha)
+		expectSameJSON(beta, origBeta)
+	}, strategyParameterEntries())
+
+	DescribeTable("round-trips legacy parameter references from alpha", func(legacy, canonical string) {
+		alpha := &buildapialpha.BuildStrategy{TypeMeta: metav1.TypeMeta{Kind: "BuildStrategy", APIVersion: "shipwright.io/v1alpha1"}, Spec: sampleAlphaStrategySpec()}
+		alpha.Spec.BuildSteps[0].Command = []string{"build", "--file=" + legacy}
+		alpha.Spec.BuildSteps[0].Args = []string{legacy + " " + legacy}
+		alpha.Spec.BuildSteps[0].Env = []corev1.EnvVar{{Name: "PARAM", Value: legacy}}
+		orig := alpha.DeepCopy()
+		beta := &buildapi.BuildStrategy{}
+		Expect(beta.ConvertFrom(context.Background(), asUnstructured(alpha))).To(Succeed())
+		Expect(beta.Spec.Parameters).To(HaveLen(2))
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		// build.dockerfile and params.DOCKERFILE migrate to the same beta
+		// parameter, so converting back uses the canonical alpha spelling.
+		orig.Spec.BuildSteps[0].Command[1] = "--file=" + canonical
+		orig.Spec.BuildSteps[0].Args[0] = canonical + " " + canonical
+		orig.Spec.BuildSteps[0].Env[0].Value = canonical
+		expectSameJSON(alphaFromUnstructured(u), orig)
+	}, Entry("DOCKERFILE", "$(params.DOCKERFILE)", "$(params.DOCKERFILE)"), Entry("build.dockerfile", "$(build.dockerfile)", "$(params.DOCKERFILE)"), Entry("builder image", "$(build.builder.image)", "$(build.builder.image)"))
 })

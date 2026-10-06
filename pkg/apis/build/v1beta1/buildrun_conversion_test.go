@@ -485,3 +485,130 @@ var _ = Describe("BuildRun conversion", func() {
 		Expect(got.Status.FailureDetails).To(Equal(orig.Status.FailureDetails))
 	})
 })
+
+var _ = Describe("BuildRun conversion field coverage", func() {
+	DescribeTable("preserves parameter variants in both directions", func(raw string) {
+		betaParam, alphaParam := parameterPair(raw)
+		beta := sampleBetaBuildRun()
+		beta.Spec.ParamValues = []buildapi.ParamValue{betaParam}
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		expectSameJSON(alphaBuildRunFromUnstructured(u).Spec.ParamValues, []buildapialpha.ParamValue{alphaParam})
+		alpha := sampleAlphaBuildRun()
+		alpha.Spec.ParamValues = []buildapialpha.ParamValue{alphaParam}
+		got := &buildapi.BuildRun{}
+		Expect(got.ConvertFrom(context.Background(), asUnstructured(alpha))).To(Succeed())
+		expectSameJSON(got.Spec.ParamValues, []buildapi.ParamValue{betaParam})
+		Expect(got.ConvertTo(context.Background(), u)).To(Succeed())
+		expectSameJSON(alphaBuildRunFromUnstructured(u), alpha)
+	}, parameterEntries())
+
+	DescribeTable("round-trips all shared spec and status fields from alpha", func(embedded bool, bundle bool) {
+		start := sampleAlphaBuildRun()
+		if embedded {
+			start.Spec.BuildRef = nil
+			start.Spec.BuildSpec = ptr.To(sampleAlphaBuild().Spec)
+		}
+		if bundle {
+			start.Status.Sources[0].Git = nil
+			start.Status.Sources[0].Bundle = &buildapialpha.BundleSourceResult{Digest: "sha256:bundle"}
+		}
+		orig := start.DeepCopy()
+		beta := &buildapi.BuildRun{}
+		Expect(beta.ConvertFrom(context.Background(), asUnstructured(start))).To(Succeed())
+		want := sampleBetaBuildRun()
+		want.Kind, want.APIVersion = "BuildRun", "shipwright.io/v1beta1"
+		want.Spec.Source = &buildapi.BuildRunSource{Type: buildapi.LocalType, Local: &buildapi.Local{Name: "upload", Timeout: &metav1.Duration{Duration: 3 * time.Minute}}}
+		want.Spec.ParamValues = betaParamValues()
+		buildSpec := sampleBetaBuild().Spec
+		buildSpec.ParamValues = append(betaParamValues(),
+			buildapi.ParamValue{Name: "dockerfile", SingleValue: &buildapi.SingleValue{Value: ptr.To("Dockerfile.prod")}},
+			buildapi.ParamValue{Name: "builder-image", SingleValue: &buildapi.SingleValue{Value: ptr.To("golang:1.22")}},
+		)
+		want.Status.BuildSpec = &buildSpec
+		want.Status.Source.Timestamp = want.Status.StartTime
+		want.Status.TaskRunName = ptr.To("my-buildrun-pod")
+		if embedded {
+			want.Spec.Build = buildapi.ReferencedBuild{Spec: &buildSpec}
+		}
+		if bundle {
+			want.Status.Source.Git = nil
+			want.Status.Source.OciArtifact = &buildapi.OciArtifactSourceResult{Digest: "sha256:bundle"}
+		}
+		expectSameJSON(beta, want)
+		// Also exercise beta -> alpha using the independent beta fixture.
+		direct := &unstructured.Unstructured{}
+		Expect(want.ConvertTo(context.Background(), direct)).To(Succeed())
+		expectSameJSON(alphaBuildRunFromUnstructured(direct), orig)
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		expectSameJSON(alphaBuildRunFromUnstructured(u), orig)
+	}, Entry("build reference and Git status", false, false), Entry("embedded build and Git status", true, false), Entry("build reference and OCI status", false, true), Entry("embedded build and OCI status", true, true))
+
+	DescribeTable("round-trips failure details with optional locations", func(location bool) {
+		start := sampleBetaBuildRun()
+		if !location {
+			start.Status.FailureDetails.Location = nil
+		}
+		u := &unstructured.Unstructured{}
+		Expect(start.ConvertTo(context.Background(), u)).To(Succeed())
+		alpha := alphaBuildRunFromUnstructured(u)
+		Expect(alpha.Status.FailureDetails.Message).To(Equal("exit 1"))
+		got := &buildapi.BuildRun{}
+		Expect(got.ConvertFrom(context.Background(), u)).To(Succeed())
+		expectSameJSON(got.Status.FailureDetails, start.Status.FailureDetails)
+	}, Entry("with location", true), Entry("without location", false))
+
+	It("prefers FailureDetails when the deprecated FailedAt disagrees", func() {
+		alpha := sampleAlphaBuildRun()
+		//nolint:staticcheck // Verify the newer field remains authoritative over deprecated status.
+		alpha.Status.FailedAt = &buildapialpha.FailedAt{Pod: "legacy-pod", Container: "legacy-step"}
+		got := &buildapi.BuildRun{}
+		Expect(got.ConvertFrom(context.Background(), asUnstructured(alpha))).To(Succeed())
+		expectSameJSON(got.Status.FailureDetails, sampleBetaBuildRun().Status.FailureDetails)
+	})
+
+	It("prefers Executor over the deprecated TaskRunName", func() {
+		beta := sampleBetaBuildRun()
+		beta.Status.TaskRunName = ptr.To("legacy-taskrun")
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		Expect(alphaBuildRunFromUnstructured(u).Status.LatestTaskRunRef).To(Equal(ptr.To(beta.Status.Executor.Name)))
+	})
+
+	It("round-trips absent optional fields", func() {
+		start := &buildapialpha.BuildRun{TypeMeta: metav1.TypeMeta{Kind: "BuildRun", APIVersion: "shipwright.io/v1alpha1"}, ObjectMeta: metav1.ObjectMeta{Name: "minimal"}, Spec: buildapialpha.BuildRunSpec{BuildRef: &buildapialpha.BuildRef{Name: "build"}}}
+		beta := &buildapi.BuildRun{}
+		Expect(beta.ConvertFrom(context.Background(), asUnstructured(start))).To(Succeed())
+		Expect(beta.Spec.ServiceAccount).To(BeNil())
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		// Existing webhook compatibility tests specify an empty alpha
+		// serviceAccount for an unset beta service account (default semantics).
+		start.Spec.ServiceAccount = &buildapialpha.ServiceAccount{}
+		expectSameJSON(alphaBuildRunFromUnstructured(u), start)
+	})
+})
+
+var _ = Describe("BuildRun conversion API differences", func() {
+	It("omits beta-only spec and status fields from alpha", func() {
+		// These fields do not exist in the alpha schema. This is distinct from
+		// losing shared fields such as output.insecure or FailureDetails.
+		beta := sampleBetaBuildRun()
+		beta.Spec.NodeSelector = map[string]string{"pool": "build"}
+		beta.Spec.Tolerations = []corev1.Toleration{{Key: "build", Operator: corev1.TolerationOpExists}}
+		beta.Spec.SchedulerName, beta.Spec.RuntimeClassName = ptr.To("scheduler"), ptr.To("runtime")
+		beta.Spec.StepResources = []buildapi.StepResourceOverride{{Name: "build", Resources: conversionStepResources()}}
+		beta.Spec.Output.VulnerabilityScan = &buildapi.VulnerabilityScanOptions{Enabled: true}
+		beta.Spec.Output.Platforms = []buildapi.ImagePlatform{{OS: "linux", Arch: "arm64"}}
+		beta.Status.Output.Vulnerabilities = []buildapi.Vulnerability{{ID: "CVE-TEST", Severity: buildapi.High}}
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		for _, field := range [][]string{{"spec", "nodeSelector"}, {"spec", "tolerations"}, {"spec", "schedulerName"}, {"spec", "runtimeClassName"}, {"spec", "stepResources"}, {"spec", "output", "vulnerabilityScan"}, {"spec", "output", "platforms"}, {"status", "output", "vulnerabilities"}, {"status", "executor"}} {
+			_, found, err := unstructured.NestedFieldNoCopy(u.Object, field...)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeFalse(), "alpha has no %v field", field)
+		}
+		Expect(alphaBuildRunFromUnstructured(u).Status.LatestTaskRunRef).To(Equal(ptr.To(beta.Status.Executor.Name)))
+	})
+})

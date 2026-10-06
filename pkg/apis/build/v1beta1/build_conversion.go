@@ -239,6 +239,7 @@ func (dest *BuildSpec) ConvertFrom(orig *buildapialpha.BuildSpec) error {
 func (dest *BuildSpec) ConvertTo(bs *buildapialpha.BuildSpec) error {
 	// Handle BuildSpec Sources or Source
 	if dest.Source != nil && dest.Source.Type == LocalType && dest.Source.Local != nil {
+		bs.Source.ContextDir = dest.Source.ContextDir
 		bs.Sources = append(bs.Sources, buildapialpha.BuildSource{
 			Name:    dest.Source.Local.Name,
 			Type:    buildapialpha.LocalCopy,
@@ -273,12 +274,12 @@ func (dest *BuildSpec) ConvertTo(bs *buildapialpha.BuildSpec) error {
 	// Handle BuildSpec ParamValues
 	bs.ParamValues = nil
 	for _, p := range dest.ParamValues {
-		if p.Name == "dockerfile" && p.SingleValue != nil {
+		if p.Name == "dockerfile" && p.SingleValue != nil && p.Value != nil {
 			bs.Dockerfile = p.Value
 			continue
 		}
 
-		if p.Name == "builder-image" && p.SingleValue != nil {
+		if p.Name == "builder-image" && p.SingleValue != nil && p.Value != nil {
 			bs.Builder = &buildapialpha.Image{
 				Image: *p.Value,
 			}
@@ -340,13 +341,13 @@ func (p ParamValue) convertToAlpha(dest *buildapialpha.ParamValue) {
 		dest.Value = p.Value
 	}
 
-	if p.ConfigMapValue != nil {
+	if p.SingleValue != nil && p.ConfigMapValue != nil {
 		dest.SingleValue = &buildapialpha.SingleValue{
 			ConfigMapValue: (*buildapialpha.ObjectKeyRef)(p.ConfigMapValue),
 		}
 	}
 
-	if p.SecretValue != nil {
+	if p.SingleValue != nil && p.SecretValue != nil {
 		dest.SingleValue = &buildapialpha.SingleValue{
 			SecretValue: (*buildapialpha.ObjectKeyRef)(p.SecretValue),
 		}
@@ -367,11 +368,13 @@ func (p TriggerWhen) convertToAlpha(dest *buildapialpha.TriggerWhen) {
 	dest.Name = p.Name
 	dest.Type = buildapialpha.TriggerType(p.Type)
 
-	dest.GitHub = &buildapialpha.WhenGitHub{}
-	for _, e := range p.GitHub.Events {
-		dest.GitHub.Events = append(dest.GitHub.Events, buildapialpha.GitHubEventName(e))
+	if p.GitHub != nil {
+		dest.GitHub = &buildapialpha.WhenGitHub{}
+		for _, e := range p.GitHub.Events {
+			dest.GitHub.Events = append(dest.GitHub.Events, buildapialpha.GitHubEventName(e))
+		}
+		dest.GitHub.Branches = p.GetBranches(GitHubWebHookTrigger)
 	}
-	dest.GitHub.Branches = p.GetBranches(GitHubWebHookTrigger)
 
 	dest.Image = (*buildapialpha.WhenImage)(p.Image)
 	dest.ObjectRef = (*buildapialpha.WhenObjectRef)(p.ObjectRef)
@@ -385,11 +388,11 @@ func convertBetaParamValue(orig buildapialpha.ParamValue) ParamValue {
 		p.Value = orig.Value
 	}
 
-	if orig.ConfigMapValue != nil {
+	if orig.SingleValue != nil && orig.ConfigMapValue != nil {
 		p.SingleValue = &SingleValue{}
 		p.ConfigMapValue = (*ObjectKeyRef)(orig.ConfigMapValue)
 	}
-	if orig.SecretValue != nil {
+	if orig.SingleValue != nil && orig.SecretValue != nil {
 		p.SingleValue = &SingleValue{}
 		p.SecretValue = (*ObjectKeyRef)(orig.SecretValue)
 	}
@@ -412,12 +415,13 @@ func convertToBetaTriggers(orig *buildapialpha.TriggerWhen) TriggerWhen {
 		Type: TriggerType(orig.Type),
 	}
 
-	dest.GitHub = &WhenGitHub{}
-	for _, e := range orig.GitHub.Events {
-		dest.GitHub.Events = append(dest.GitHub.Events, GitHubEventName(e))
+	if orig.GitHub != nil {
+		dest.GitHub = &WhenGitHub{}
+		for _, e := range orig.GitHub.Events {
+			dest.GitHub.Events = append(dest.GitHub.Events, GitHubEventName(e))
+		}
+		dest.GitHub.Branches = orig.GetBranches(buildapialpha.GitHubWebHookTrigger)
 	}
-
-	dest.GitHub.Branches = orig.GetBranches(buildapialpha.GitHubWebHookTrigger)
 	dest.Image = (*WhenImage)(orig.Image)
 	dest.ObjectRef = (*WhenObjectRef)(orig.ObjectRef)
 

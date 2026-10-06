@@ -6,6 +6,8 @@ package v1beta1_test
 
 import (
 	"context"
+	"encoding/json"
+	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -534,5 +536,139 @@ var _ = Describe("BuildSpec ConvertTo", func() {
 		}).ToNot(Panic())
 
 		Expect(dest.Source.BundleContainer).To(BeNil())
+	})
+})
+
+var _ = Describe("Build conversion field coverage", func() {
+	DescribeTable("preserves parameter variants in both directions", func(raw string) {
+		betaParam, alphaParam := parameterPair(raw)
+		beta := sampleBetaBuild()
+		beta.Spec.ParamValues = []buildapi.ParamValue{betaParam}
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		alpha := alphaBuildFromUnstructured(u)
+		expectSameJSON(alpha.Spec.ParamValues, []buildapialpha.ParamValue{alphaParam})
+		Expect(alpha.Spec.Dockerfile).To(BeNil())
+		Expect(alpha.Spec.Builder).To(BeNil())
+
+		start := sampleAlphaBuild()
+		start.Spec.Dockerfile, start.Spec.Builder = nil, nil
+		start.Spec.ParamValues = []buildapialpha.ParamValue{alphaParam}
+		got := &buildapi.Build{}
+		Expect(got.ConvertFrom(context.Background(), asUnstructured(start))).To(Succeed())
+		expectSameJSON(got.Spec.ParamValues, []buildapi.ParamValue{betaParam})
+		back := &unstructured.Unstructured{}
+		Expect(got.ConvertTo(context.Background(), back)).To(Succeed())
+		expectSameJSON(alphaBuildFromUnstructured(back), start)
+	}, parameterEntries())
+
+	DescribeTable("round-trips every supported source from alpha", func(sourceType string) {
+		start := sampleAlphaBuild()
+		switch sourceType {
+		case "OCI":
+			start.Spec.Source = buildapialpha.Source{ContextDir: ptr.To("app"), Credentials: &corev1.LocalObjectReference{Name: "oci-secret"}, BundleContainer: &buildapialpha.BundleContainer{Image: "quay.io/example/src:1", Prune: ptr.To(buildapialpha.PruneNever)}}
+		case "Local":
+			start.Spec.Source = buildapialpha.Source{ContextDir: ptr.To("workdir")}
+			start.Spec.Sources = []buildapialpha.BuildSource{{Name: "upload", Type: buildapialpha.LocalCopy, Timeout: &metav1.Duration{Duration: 5 * time.Minute}}}
+		}
+		orig := start.DeepCopy()
+		beta := &buildapi.Build{}
+		Expect(beta.ConvertFrom(context.Background(), asUnstructured(start))).To(Succeed())
+		Expect(string(beta.Spec.Source.Type)).To(Equal(sourceType))
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		expectSameJSON(alphaBuildFromUnstructured(u), orig)
+	}, Entry("Git", "Git"), Entry("OCI", "OCI"), Entry("Local", "Local"))
+
+	DescribeTable("preserves each trigger variant in both directions", func(raw string) {
+		var alphaWhen buildapialpha.TriggerWhen
+		var betaWhen buildapi.TriggerWhen
+		Expect(json.Unmarshal([]byte(raw), &alphaWhen)).To(Succeed())
+		Expect(json.Unmarshal([]byte(raw), &betaWhen)).To(Succeed())
+		start := sampleAlphaBuild()
+		start.Spec.Trigger.When = []buildapialpha.TriggerWhen{alphaWhen}
+		beta := &buildapi.Build{}
+		Expect(beta.ConvertFrom(context.Background(), asUnstructured(start))).To(Succeed())
+		expectSameJSON(beta.Spec.Trigger.When, []buildapi.TriggerWhen{betaWhen})
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		expectSameJSON(alphaBuildFromUnstructured(u), start)
+	},
+		Entry("GitHub", `{"name":"push","type":"GitHub","github":{"events":["Push","PullRequest"],"branches":["main","release"]}}`),
+		Entry("Image", `{"name":"image","type":"Image","image":{"names":["quay.io/example/base"]}}`),
+		Entry("Pipeline", `{"name":"pipeline","type":"Pipeline","objectRef":{"name":"pipeline","status":["Succeeded"],"selector":{"app":"test"}}}`),
+	)
+
+	DescribeTable("preserves deletion retention with no other retention settings", func(enabled bool) {
+		start := sampleBetaBuild()
+		start.Spec.Retention = &buildapi.BuildRetention{AtBuildDeletion: ptr.To(enabled)}
+		u := &unstructured.Unstructured{}
+		Expect(start.ConvertTo(context.Background(), u)).To(Succeed())
+		alpha := alphaBuildFromUnstructured(u)
+		Expect(alpha.Spec.Retention).To(BeNil())
+		Expect(alpha.Annotations).To(HaveKeyWithValue(buildapialpha.AnnotationBuildRunDeletion, strconv.FormatBool(enabled)))
+		got := &buildapi.Build{}
+		Expect(got.ConvertFrom(context.Background(), u)).To(Succeed())
+		expectSameJSON(got.Spec.Retention, start.Spec.Retention)
+		Expect(got.Annotations).To(Equal(start.Annotations))
+	}, Entry("enabled", true), Entry("disabled", false))
+
+	It("compares all shared spec and status fields with independent expected fixtures", func() {
+		alpha := sampleAlphaBuild()
+		beta := sampleBetaBuild()
+		beta.Kind, beta.APIVersion = "Build", "shipwright.io/v1beta1"
+		beta.Spec.ParamValues = append(betaParamValues(),
+			buildapi.ParamValue{Name: "dockerfile", SingleValue: &buildapi.SingleValue{Value: ptr.To("Dockerfile.prod")}},
+			buildapi.ParamValue{Name: "builder-image", SingleValue: &buildapi.SingleValue{Value: ptr.To("golang:1.22")}},
+		)
+		got := &buildapi.Build{}
+		Expect(got.ConvertFrom(context.Background(), asUnstructured(alpha))).To(Succeed())
+		expectSameJSON(got, beta)
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		expectSameJSON(alphaBuildFromUnstructured(u), alpha)
+	})
+
+	It("round-trips absent optional fields", func() {
+		start := &buildapi.Build{TypeMeta: metav1.TypeMeta{Kind: "Build", APIVersion: "shipwright.io/v1beta1"}, ObjectMeta: metav1.ObjectMeta{Name: "minimal"}, Spec: buildapi.BuildSpec{Strategy: buildapi.Strategy{Name: "kaniko"}, Output: buildapi.Image{Image: "quay.io/example/app"}}}
+		u := &unstructured.Unstructured{}
+		Expect(start.ConvertTo(context.Background(), u)).To(Succeed())
+		got := &buildapi.Build{}
+		Expect(got.ConvertFrom(context.Background(), u)).To(Succeed())
+		expectSameJSON(got, start)
+	})
+})
+
+var _ = Describe("Build conversion API differences", func() {
+	DescribeTable("preserves strategy kinds", func(kind *buildapialpha.BuildStrategyKind) {
+		start := sampleAlphaBuild()
+		start.Spec.Strategy.Kind = kind
+		beta := &buildapi.Build{}
+		Expect(beta.ConvertFrom(context.Background(), asUnstructured(start))).To(Succeed())
+		expectSameJSON(beta.Spec.Strategy.Kind, kind)
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		expectSameJSON(alphaBuildFromUnstructured(u), start)
+	}, Entry("default", (*buildapialpha.BuildStrategyKind)(nil)), Entry("namespaced", ptr.To(buildapialpha.NamespacedBuildStrategyKind)), Entry("cluster", ptr.To(buildapialpha.ClusterBuildStrategyKind)))
+
+	It("omits beta-only fields which have no representation in alpha", func() {
+		// Scheduling, resource overrides, shallow cloning, vulnerability scans,
+		// and multi-platform output were added only to beta. A lossless round
+		// trip cannot be expected for these fields through the alpha schema.
+		beta := sampleBetaBuild()
+		beta.Spec.NodeSelector = map[string]string{"pool": "build"}
+		beta.Spec.Tolerations = []corev1.Toleration{{Key: "build", Operator: corev1.TolerationOpExists}}
+		beta.Spec.SchedulerName, beta.Spec.RuntimeClassName = ptr.To("scheduler"), ptr.To("runtime")
+		beta.Spec.Strategy.StepResources = []buildapi.StepResourceOverride{{Name: "build", Resources: conversionStepResources()}}
+		beta.Spec.Source.Git.Depth = ptr.To(5)
+		beta.Spec.Output.VulnerabilityScan = &buildapi.VulnerabilityScanOptions{Enabled: true}
+		beta.Spec.Output.Platforms = []buildapi.ImagePlatform{{OS: "linux", Arch: "arm64"}}
+		u := &unstructured.Unstructured{}
+		Expect(beta.ConvertTo(context.Background(), u)).To(Succeed())
+		for _, field := range [][]string{{"spec", "nodeSelector"}, {"spec", "tolerations"}, {"spec", "schedulerName"}, {"spec", "runtimeClassName"}, {"spec", "strategy", "stepResources"}, {"spec", "source", "depth"}, {"spec", "source", "git"}, {"spec", "output", "vulnerabilityScan"}, {"spec", "output", "platforms"}} {
+			_, found, err := unstructured.NestedFieldNoCopy(u.Object, field...)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeFalse(), "alpha has no %v field", field)
+		}
 	})
 })
